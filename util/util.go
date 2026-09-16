@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jhoonb/archivex"
 )
 
 // Expand tilde in paths
@@ -30,56 +28,6 @@ func Expand(input string) string {
 		input = filepath.Join(dir, input[2:])
 	}
 	return input
-}
-
-// ZipFiles and return the resulting zip's filename
-func ZipFiles(files []string) (string, error) {
-	zip := new(archivex.ZipFile)
-	tmpfile, err := os.CreateTemp("", "qrcp")
-	if err != nil {
-		return "", err
-	}
-	tmpfile.Close()
-	if err := os.Rename(tmpfile.Name(), tmpfile.Name()+".zip"); err != nil {
-		return "", err
-	}
-	tmpfile, err = os.OpenFile(tmpfile.Name()+".zip", os.O_RDWR, 0644)
-	if err != nil {
-		return "", err
-	}
-	if err := zip.CreateWriter(tmpfile.Name(), tmpfile); err != nil {
-		return "", err
-	}
-
-	for _, filename := range files {
-		fileinfo, err := os.Stat(filename)
-		if err != nil {
-			return "", err
-		}
-		if fileinfo.IsDir() {
-			if err := zip.AddAll(filename, true); err != nil {
-				return "", err
-			}
-		} else {
-			file, err := os.Open(filename)
-			if err != nil {
-				return "", err
-			}
-			defer file.Close()
-			if err := zip.Add(filename, file, fileinfo); err != nil {
-				return "", err
-			}
-		}
-	}
-
-	if err := zip.Writer.Close(); err != nil {
-		return "", err
-	}
-	if err := tmpfile.Close(); err != nil {
-		return "", err
-	}
-
-	return zip.Name, nil
 }
 
 // GetRandomURLPath returns a random string of 4 alphanumeric characters

@@ -29,6 +29,8 @@ type Config struct {
 	FQDN      string `yaml:",omitempty"`
 	Output    string `yaml:",omitempty"`
 	Reversed  bool   `yaml:",omitempty"`
+	ChunkSize int    `yaml:",omitempty"`
+	TTL       string `yaml:",omitempty"`
 }
 
 var interactive bool = false
@@ -65,6 +67,8 @@ func New(app application.App) Config {
 	cfg.FQDN = v.GetString("fqdn")
 	cfg.Output = v.GetString("output")
 	cfg.Reversed = v.GetBool("reversed")
+	cfg.ChunkSize = v.GetInt("chunkSize")
+	cfg.TTL = v.GetString("ttl")
 
 	// Override
 	if app.Flags.Interface != "" {
@@ -100,6 +104,14 @@ func New(app application.App) Config {
 	if app.Flags.Reversed {
 		cfg.Reversed = true
 	}
+	if app.Flags.ChunkSize != 0 {
+		cfg.ChunkSize = app.Flags.ChunkSize
+	}
+	if app.Flags.TTL != "" {
+		cfg.TTL = app.Flags.TTL
+	}
+	// Defaults for ChunkSize/TTL are applied by the send command itself so
+	// that config.New stays a pure mapping.
 
 	// Discover interface if it's not been set yet
 	if !interactive {

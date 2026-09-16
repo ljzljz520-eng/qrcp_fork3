@@ -1,5 +1,13 @@
 package pages
 
+import _ "embed"
+
+// Transfer is the QCTP v1 chunked-transfer web client. The server replaces
+// __QCTP_TOKEN__ with the session token before serving the page.
+//
+//go:embed transfer.html
+var Transfer string
+
 // Upload page
 var Upload = `
 <!doctype html>

@@ -24,6 +24,8 @@ func receiveCmdFunc(command *cobra.Command, args []string) error {
 	if err := srv.ReceiveTo(cfg.Output); err != nil {
 		return err
 	}
+	// Start accepting connections.
+	srv.Serve()
 	// Prints the URL to scan to screen
 	log.Print(`Scan the following URL with a QR reader to start the file transfer, press CTRL+C or "q" to exit:`)
 	log.Print(srv.ReceiveURL)

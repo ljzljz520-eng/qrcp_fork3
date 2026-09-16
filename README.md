@@ -82,7 +82,12 @@ qrcp --help
 | **Send a file**             | `qrcp MyDocument.pdf`             |
 | **Send multiple files**     | `qrcp MyDocument.pdf IMG0001.jpg` |
 | **Send a folder**           | `qrcp Documents/`                 |
-| **Zip before transferring** | `qrcp --zip LongVideo.avi`        |
+| **Use smaller chunks**      | `qrcp --chunk-size 1 LongVideo.avi` |
+| **Short-lived session**     | `qrcp --ttl 30m LongVideo.avi`    |
+
+Files and folders are sent with the resumable chunked transfer protocol (see
+[Resumable Chunked Transfers](#resumable-chunked-transfers)); no ZIP archive
+is generated.
 
 ### Receive Files
 
@@ -117,12 +122,68 @@ qrcp --config /tmp/qrcp.yml MyDocument.pdf
 | `secure`    | Bool    | Use HTTPS instead of HTTP. Defaults to `false`.                                |
 | `tls-cert`  | String  | Path to the TLS certificate. Used only when `secure: true`.                    |
 | `tls-key`   | String  | Path to the TLS key. Used only when `secure: true`.                            |
+| `chunkSize` | Integer | Chunk size in MiB for resumable transfers. Defaults to `4`.                    |
+| `ttl`       | String  | Session lifetime (Go duration, e.g. `30m`, `24h`). Defaults to `24h`.          |
 
 ### Environment Variables
 All configuration parameters can also be set via environment variables prefixed with `QRCP_`:
 - `$QRCP_INTERFACE`
 - `$QRCP_PORT`
 - `$QRCP_KEEPALIVE`
+
+---
+
+## Resumable Chunked Transfers
+
+Sending files no longer creates a temporary ZIP. Instead, `qrcp` builds a
+**manifest** of the selected files and folders (relative paths, sizes,
+permissions and modification times), splits every file into fixed-size
+chunks and serves a small chunk API. Files are read from disk on demand, so
+large transfers start immediately and use no extra disk space.
+
+Each chunk carries a SHA-256 hash and the manifest is protected by a
+**Merkle tree**: chunk hashes roll up into per-file roots, and file roots
+(plus path/size/mode/mod-time metadata) roll up into a single global root.
+The browser verifies three levels — chunk hash, file root, global root —
+before reporting success. A corrupted chunk is detected and re-downloaded
+on its own; everything else is kept.
+
+The page downloads up to 6 chunks in parallel across all files, stores
+progress locally and resumes after a reload, a network drop or a browser
+restart: only missing chunks are requested. The session is authorized with
+a random token embedded in the page and expires after the configured TTL
+(expired sessions return HTTP 410 and the page stops scheduling).
+
+### Flags
+
+| Flag           | Default | Description                                                              |
+|----------------|---------|--------------------------------------------------------------------------|
+| `--chunk-size` | `4`     | Chunk size in MiB. Smaller chunks mean finer-grained resume.             |
+| `--ttl`        | `24h`   | Session lifetime as a Go duration (`30m`, `4h`, `24h`).                  |
+
+### Browser support
+
+The transfer page is fully self-contained (no external resources) and works
+in two save modes:
+
+| Browser capability                        | Save mode       | Behavior                                                                 |
+|-------------------------------------------|-----------------|--------------------------------------------------------------------------|
+| File System Access API (Chrome/Edge 86+)  | Direct write    | Pick a file (single file) or a folder (multiple files/directories); chunks are written at offsets and the full tree is reconstructed on disk. Handles are remembered for resume. |
+| Other browsers (Safari/Firefox, or `?blob`) | Cache + download | Chunks are cached in IndexedDB; after verification each file is assembled and saved via the browser download UI. Append `?blob` to the transfer URL to force this mode. |
+
+Both modes keep the same resumable download and integrity-verification
+behavior.
+
+**Secure contexts (HTTP vs HTTPS).** Direct-write mode requires the File System
+Access API, which browsers only expose in secure contexts: `https://` URLs and
+`localhost`/`127.0.0.1`. On a plain `http://<lan-ip>` URL (the qrcp
+default), Chrome and Safari automatically use the cache + download mode; the page
+ships a small self-contained pure-Java SHA-256 implementation so chunk
+verification, resume and Merkle verification still work without
+`crypto.subtle`. To get direct folder writes on a LAN URL, serve TLS with
+`qrcp --secure --tls-cert … --tls-key …` (for example with a
+[`mkcert`](https://github.com/FiloSottile/mkcert) certificate trusted by
+your phone). Firefox still exposes `crypto.subtle` over plain HTTP.
 
 ---
 

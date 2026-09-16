@@ -9,7 +9,6 @@ type Flags struct {
 	Interface         string
 	Bind              string
 	FQDN              string
-	Zip               bool
 	Config            string
 	Browser           bool
 	Secure            bool
@@ -17,6 +16,8 @@ type Flags struct {
 	TlsKey            string
 	Output            string
 	Reversed          bool
+	ChunkSize         int
+	TTL               string
 }
 
 type App struct {

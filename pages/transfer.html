@@ -1,0 +1,1065 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>qrcp 分块传输</title>
+<style>
+  :root {
+    --bg: #f5f7fb; --card: #ffffff; --text: #1f2937; --muted: #6b7280;
+    --accent: #2563eb; --accent-weak: #dbeafe; --ok: #16a34a; --warn: #d97706;
+    --err: #dc2626; --err-weak: #fee2e2; --border: #e5e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; background: var(--accent-weak); color: var(--accent);
+  }
+  .badge.ok { background: #dcfce7; color: var(--ok); }
+  .badge.warn { background: #fef3c7; color: var(--warn); }
+  .badge.err { background: var(--err-weak); color: var(--err); }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .bar { height: 8px; background: #eef2f7; border-radius: 999px; overflow: hidden; margin: 8px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .bar.ok > div { background: var(--ok); }
+  .stats { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .files { margin-top: 10px; }
+  .file { padding: 10px 0; border-top: 1px solid var(--border); }
+  .file:first-child { border-top: 0; }
+  .fname { font-size: 13px; word-break: break-all; display: flex; align-items: center; gap: 6px; }
+  .ficon { width: 16px; flex: 0 0 16px; text-align: center; }
+  button {
+    appearance: none; border: 0; border-radius: 10px; padding: 12px 18px;
+    font-size: 15px; font-weight: 600; background: var(--accent); color: #fff;
+    width: 100%; cursor: pointer; margin-top: 10px;
+  }
+  button.secondary { background: #eef2f7; color: var(--text); }
+  button:disabled { opacity: .55; cursor: default; }
+  button.small { width: auto; padding: 7px 12px; font-size: 12px; margin: 4px 6px 0 0; }
+  #log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+    color: var(--muted); max-height: 120px; overflow: auto; white-space: pre-wrap;
+    background: #f8fafc; border-radius: 8px; padding: 8px; margin-top: 10px;
+  }
+  .hashline { font-family: ui-monospace, Menlo, monospace; font-size: 11px; word-break: break-all; }
+  .savefile { display: block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <h1>qrcp 分块传输</h1>
+      <span id="phase" class="badge">准备中</span>
+    </div>
+    <div class="sub" id="session-info"></div>
+    <div class="bar" id="overall-bar"><div></div></div>
+    <div class="stats">
+      <span id="st-percent">0%</span>
+      <span id="st-bytes"></span>
+      <span id="st-speed"></span>
+      <span id="st-eta"></span>
+      <span id="st-retries"></span>
+    </div>
+    <button id="btn-main" disabled>开始传输</button>
+    <button id="btn-cleanup" class="secondary" style="display:none">清除本机已缓存的分块</button>
+    <div id="save-actions"></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><strong>文件清单</strong><span class="sub" id="hashing-info"></span></div>
+    <div class="files" id="files"></div>
+  </div>
+
+  <div class="card" id="verify-card" style="display:none">
+    <strong>完整性验证</strong>
+    <div id="verify-body" class="hashline" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <strong>传输日志</strong>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================== 常量与工具 ============================== */
+
+const QCTP_TOKEN = "__QCTP_TOKEN__";
+const API_BASE = location.pathname.replace(/\/+$/, "") + "/api";
+const CONCURRENCY = 6;
+const NETWORK_RETRIES = 10;
+const EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const urlParams = new URLSearchParams(location.search);
+const FORCE_BLOB = urlParams.has("blob");
+const DEBUG_HOOKS = urlParams.get("debug") === "1";
+// crypto.subtle 只在安全上下文（HTTPS 或 localhost/127.0.0.1）中可用；
+// qrcp 默认的局域网 HTTP URL 下它是 undefined，此时回落到内置纯 JS 实现。
+const SUBTLE_OK = !!(window.crypto && crypto.subtle && typeof crypto.subtle.digest === "function");
+
+const textEncoder = new TextEncoder();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function fmtBytes(n) {
+  if (n < 1024) return n + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v < 10 ? 1 : 0) + " " + units[i];
+}
+function fmtClock(ms) {
+  if (!isFinite(ms) || ms < 0) return "--";
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h ? h + "时" : "") + (m || h ? m + "分" : "") + (s % 60) + "秒";
+}
+function basename(p) { return p.split("/").pop(); }
+function dirname(p) { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); }
+
+function bytesToHex(u8) {
+  let s = "";
+  for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0");
+  return s;
+}
+
+// 纯 JS SHA-256（FIPS 180-4），仅在 crypto.subtle 不可用时使用。
+// 输入长度远小于 2^32 位（分块只有几 MiB），长度字段高位恒为 0。
+function sha256Js(input) {
+  const K = new Uint32Array([
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ]);
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const len = bytes.length;
+  const total = (((len + 9) + 63) >> 6) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(total - 4, (len * 8) >>> 0, false); // 块大小远 <512MiB
+  const H = new Uint32Array([
+    0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
+  ]);
+  const W = new Uint32Array(64);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(W[i - 15], 7) ^ rotr(W[i - 15], 18) ^ (W[i - 15] >>> 3);
+      const s1 = rotr(W[i - 2], 17) ^ rotr(W[i - 2], 19) ^ (W[i - 2] >>> 10);
+      W[i] = (W[i - 16] + s0 + W[i - 7] + s1) >>> 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + W[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0;
+    H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0;
+    H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+  const out = new Uint8Array(32);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, H[i], false);
+  return out;
+}
+
+async function sha256Hex(input) {
+  const data = typeof input === "string" ? textEncoder.encode(input)
+    : input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (SUBTLE_OK) {
+    const sum = await crypto.subtle.digest("SHA-256", data);
+    return bytesToHex(new Uint8Array(sum));
+  }
+  return bytesToHex(sha256Js(data));
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+async function merkleRoot(leaves) {
+  if (!leaves.length) return await sha256Hex(new Uint8Array(0));
+  let level = leaves.slice();
+  while (level.length > 1) {
+    if (level.length % 2 === 1) level.push(level[level.length - 1]);
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const concat = new Uint8Array(64);
+      concat.set(hexToBytes(level[i]), 0);
+      concat.set(hexToBytes(level[i + 1]), 32);
+      next.push(await sha256Hex(concat));
+    }
+    level = next;
+  }
+  return level[0];
+}
+function fileBindingHash(e, fileRoot) {
+  return sha256Hex("qctp-v1\n" + e.path + "\n" + e.size + "\n" + e.mode + "\n" +
+    e.modTime + "\n" + (fileRoot || ""));
+}
+
+/* ============================== IndexedDB ============================== */
+
+const DB_NAME = "qrcp-xfer";
+let idb = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("sessions")) db.createObjectStore("sessions");
+      if (!db.objectStoreNames.contains("chunks")) db.createObjectStore("chunks");
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbTx(store, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = idb.transaction(store, mode);
+    const req = fn(tx.objectStore(store));
+    req.onsuccess = () => { tx.oncomplete = () => resolve(req.result); };
+    req.onerror = () => reject(req.error);
+  });
+}
+const idbGet = (store, key) => idbTx(store, "readonly", (s) => s.get(key));
+const idbPut = (store, key, val) => idbTx(store, "readwrite", (s) => s.put(val, key));
+const idbDel = (store, key) => idbTx(store, "readwrite", (s) => s.delete(key));
+const idbAllKeys = (store) => idbTx(store, "readonly", (s) => s.getAllKeys());
+const chunkKey = (token, fi, ci) => token + ":" + fi + ":" + ci;
+
+/* ============================== 运行时状态 ============================== */
+
+let rec = null;              // 持久化会话记录
+let pollTimer = null;
+let queue = [];              // 待下载块 {fi, ci}
+let active = 0;
+let stopped = false;
+let speedWindow = [];        // {t, bytes}
+let lastSave = 0;
+let chunkLimit = Infinity;   // 自动化钩子：完成指定块数后自动中断
+let chunkCount = 0;
+const writables = new Map(); // fi -> FileSystemWritableFileStream（仅 fs 模式）
+const phaseEl = document.getElementById("phase");
+
+class FatalError extends Error {}
+class ExpiredError extends Error {}
+
+function log(msg) {
+  const box = document.getElementById("log");
+  box.textContent += new Date().toLocaleTimeString() + "  " + msg + "\n";
+  box.scrollTop = box.scrollHeight;
+}
+function setPhase(label, kind) {
+  phaseEl.textContent = label;
+  phaseEl.className = "badge" + (kind ? " " + kind : "");
+}
+function scheduleSave(force) {
+  const now = Date.now();
+  if (!force && now - lastSave < 500) return;
+  lastSave = now;
+  const snapshot = Object.assign({}, rec, { savedAt: now });
+  idbPut("sessions", rec.token, snapshot).catch((e) => log("状态保存失败: " + e));
+}
+
+/* ============================== Manifest ============================== */
+
+async function api(path, options) {
+  const resp = await fetch(API_BASE + "/" + path, Object.assign({
+    headers: { "X-QCTP-Token": QCTP_TOKEN }
+  }, options));
+  if (resp.status === 410) throw new ExpiredError("session expired");
+  return resp;
+}
+
+function newRecord(m) {
+  return {
+    version: 1,
+    token: m.token,
+    api: API_BASE,
+    createdAt: new Date(m.createdAt).getTime(),
+    expiresAt: new Date(m.expiresAt).getTime(),
+    chunkSize: m.chunkSize,
+    merkleRoot: m.merkleRoot || "",
+    hashingDone: !!m.hashingDone,
+    mode: null,
+    rootHandle: null,
+    fileHandles: {},
+    files: m.files.map((f) => ({
+      index: f.index, path: f.path, type: f.type, size: f.size,
+      mode: f.mode, modTime: f.modTime, chunks: f.chunks,
+      hashes: new Array(f.chunks).fill(null),
+      done: new Array(f.chunks).fill(false),
+      fileRoot: f.merkleRoot || "",
+      saved: false
+    })),
+    corruptRetries: 0,
+    bytesDone: 0,
+    started: false,
+    finished: false,
+    saved: false
+  };
+}
+
+async function mergeManifest(m) {
+  if (m.hashingError) {
+    throw new FatalError("服务端校验和失败: " + m.hashingError);
+  }
+  if (!rec) {
+    rec = (await idbGet("sessions", m.token)) || newRecord(m);
+  }
+  rec.expiresAt = new Date(m.expiresAt).getTime();
+  rec.chunkSize = m.chunkSize;
+  if (m.hashingDone) {
+    rec.hashingDone = true;
+    rec.merkleRoot = m.merkleRoot;
+  }
+  for (const rf of m.files) {
+    const lf = rec.files[rf.index];
+    if (!lf) continue;
+    if (rf.merkleRoot) lf.fileRoot = rf.merkleRoot;
+    if (rf.chunkHashes) {
+      for (let ci = 0; ci < rf.chunkHashes.length; ci++) {
+        const h = rf.chunkHashes[ci];
+        if (lf.hashes[ci] == null) {
+          lf.hashes[ci] = h;
+        } else if (lf.done[ci] && lf.hashes[ci] !== h) {
+          // 服务端清单与已完成块不一致（理论上不应发生），作废该块重下。
+          log("清单哈希变化，标记重下: " + lf.path + "#" + ci);
+          lf.done[ci] = false;
+          rec.bytesDone -= rec.chunkSize;
+          if (rec.mode === "blob") {
+            idbDel("chunks", chunkKey(rec.token, rf.index, ci)).catch(() => {});
+          }
+        }
+      }
+    }
+  }
+  scheduleSave(true);
+  render();
+}
+
+async function pollManifest() {
+  try {
+    const resp = await api("manifest");
+    if (resp.status === 403) throw new FatalError("会话 token 校验失败 (403)");
+    if (!resp.ok) throw new Error("manifest HTTP " + resp.status);
+    const m = await resp.json();
+    await mergeManifest(m);
+    if (Date.now() >= rec.expiresAt) return enterExpired();
+    if (m.hashingDone) {
+      document.getElementById("hashing-info").textContent = "服务端校验和已就绪";
+      return;
+    }
+    document.getElementById("hashing-info").textContent =
+      "服务端计算校验和中 " + Math.round((m.hashingProgress || 0) * 100) + "%";
+  } catch (e) {
+    if (e instanceof ExpiredError) return enterExpired();
+    // 403/服务端哈希失败等致命错误必须冒泡到全局错误态，不能吞掉后无限轮询。
+    if (e instanceof FatalError) return fatal(e);
+    log("清单刷新失败: " + e.message);
+  }
+  pollTimer = setTimeout(pollManifest, 1500);
+}
+
+/* ============================== 下载器 ============================== */
+
+function buildQueue() {
+  const maxChunks = rec.files.reduce((a, f) => Math.max(a, f.chunks), 0);
+  const q = [];
+  for (let ci = 0; ci < maxChunks; ci++) {
+    for (const f of rec.files) {
+      if (f.type === "file" && ci < f.chunks && !f.done[ci]) {
+        q.push({ fi: f.index, ci });
+      }
+    }
+  }
+  return q;
+}
+
+function recordSpeed(bytes) {
+  const now = performance.now();
+  speedWindow.push({ t: now, bytes });
+  speedWindow = speedWindow.filter((x) => now - x.t < 3000);
+}
+function currentSpeed() {
+  if (speedWindow.length < 1) return 0;
+  const span = performance.now() - speedWindow[0].t;
+  const bytes = speedWindow.reduce((a, x) => a + x.bytes, 0);
+  return span > 0 ? bytes * 1000 / span : 0;
+}
+
+async function fetchChunk(fi, ci) {
+  let corrupt = 0;
+  for (let attempt = 0; attempt < NETWORK_RETRIES; attempt++) {
+    let resp;
+    try {
+      resp = await api("chunk?f=" + fi + "&c=" + ci);
+    } catch (e) {
+      if (e instanceof ExpiredError) throw e;
+      await sleep(400 * Math.pow(1.6, attempt));
+      continue;
+    }
+    if (resp.status === 403) throw new FatalError("会话 token 校验失败 (403)");
+    if (resp.status === 409) {
+      throw new FatalError("源文件在传输期间发生变化，请在发送端重新发起传输 (409)");
+    }
+    if (!resp.ok) {
+      await sleep(400 * Math.pow(1.6, attempt));
+      continue;
+    }
+    const buf = await resp.arrayBuffer();
+    const lf = rec.files[fi];
+    // 长度门控：防止源文件在发送期间增长（区间按清单大小截断但内容已变）
+    // 之类的 TOCTOU 情形被当作成功块。
+    const expectedLen = Math.min(rec.chunkSize, lf.size - ci * rec.chunkSize);
+    if (buf.byteLength !== expectedLen) {
+      corrupt++;
+      rec.corruptRetries++;
+      log("块长度异常（源文件可能已变化）: " + lf.path + " 块 #" + ci +
+        "（期望 " + expectedLen + " 字节，实际 " + buf.byteLength + " 字节，第 " + corrupt + " 次重试）");
+      render();
+      scheduleSave(true);
+      await sleep(500 * Math.pow(1.5, corrupt));
+      continue;
+    }
+    const actual = await sha256Hex(new Uint8Array(buf));
+    const headerHash = resp.headers.get("X-Chunk-Sha256");
+    const expected = lf.hashes[ci] || headerHash;
+    if (actual !== expected) {
+      corrupt++;
+      rec.corruptRetries++;
+      log("校验失败，重传损坏块: " + lf.path + " 块 #" + ci +
+        "（第 " + corrupt + " 次）");
+      render();
+      scheduleSave(true);
+      await sleep(500 * Math.pow(1.5, corrupt));
+      continue;
+    }
+    if (lf.hashes[ci] == null) lf.hashes[ci] = headerHash || actual;
+    return buf;
+  }
+  throw new Error("块 " + fi + ":" + ci + " 连续多次下载失败");
+}
+
+async function writeChunk(fi, ci, buf) {
+  if (rec.mode === "fs") {
+    const wh = await ensureWritable(fi);
+    await wh.write({ type: "write", position: ci * rec.chunkSize, data: buf });
+  } else {
+    try {
+      await idbPut("chunks", chunkKey(rec.token, fi, ci),
+        { h: rec.files[fi].hashes[ci], b: new Blob([buf]) });
+    } catch (e) {
+      if (e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED")) {
+        throw new FatalError("本机存储空间不足，无法继续缓存分块；请清理磁盘空间后点“重试”");
+      }
+      throw e;
+    }
+  }
+}
+
+async function ensureWritable(fi) {
+  let wh = writables.get(fi);
+  if (wh) return wh;
+  const handle = rec.fileHandles[fi];
+  // 续传时文件里已有经回读复核的块，必须保留原数据，仅在块偏移处覆盖写。
+  wh = await handle.createWritable({ keepExistingData: true });
+  writables.set(fi, wh);
+  return wh;
+}
+async function closeWritable(fi) {
+  const wh = writables.get(fi);
+  if (!wh) return;
+  writables.delete(fi);
+  await wh.close();
+}
+
+async function worker() {
+  while (!stopped && queue.length) {
+    if (chunkCount >= chunkLimit) { stopped = true; break; }
+    const job = queue.shift();
+    if (!job) break;
+    chunkCount++;
+    active++;
+    try {
+      const { fi, ci } = job;
+      const buf = await fetchChunk(fi, ci);
+      await writeChunk(fi, ci, buf);
+      const f = rec.files[fi];
+      f.done[ci] = true;
+      rec.bytesDone += buf.byteLength;
+      recordSpeed(buf.byteLength);
+      scheduleSave(false);
+      render();
+      if (f.type === "file" && f.done.every(Boolean)) {
+        if (rec.mode === "fs") await closeWritable(fi);
+      }
+    } catch (e) {
+      if (e instanceof ExpiredError) { stopped = true; return enterExpired(); }
+      stopped = true;
+      return fatal(e);
+    } finally {
+      active--;
+    }
+  }
+}
+
+async function runWorkers() {
+  const workers = [];
+  for (let i = 0; i < CONCURRENCY; i++) workers.push(worker());
+  await Promise.all(workers);
+}
+
+async function downloadAll() {
+  if (rec && Date.now() >= rec.expiresAt) return enterExpired();
+  setPhase("下载中");
+  stopped = false;
+  chunkCount = 0;
+  queue = buildQueue();
+  log("开始下载：" + queue.length + " 个待取块，并发 " + CONCURRENCY);
+  await runWorkers();
+  if (stopped) {
+    // 中断/异常退出前务必把最新块状态落盘，便于下次恢复。
+    scheduleSave(true);
+    return;
+  }
+  await waitHashingDone();
+  // 清单哈希可能在下载途中才补齐：若据此作废了已取块（理论上不应
+  // 发生），这里重新排程补齐，避免让用户手动重试。
+  queue = buildQueue();
+  if (queue.length) {
+    log("清单补齐后补取 " + queue.length + " 个分块。");
+    stopped = false;
+    await runWorkers();
+    if (stopped) {
+      scheduleSave(true);
+      return;
+    }
+  }
+  setPhase("完整性校验中", "warn");
+  await verify();
+  await finalizeSave();
+}
+
+function totalBytes() {
+  return rec.files.reduce((a, f) => a + (f.type === "file" ? f.size : 0), 0);
+}
+function doneBytes() {
+  let n = 0;
+  for (const f of rec.files) {
+    for (let ci = 0; ci < f.chunks; ci++) if (f.done[ci]) {
+      n += Math.min(rec.chunkSize, f.size - ci * rec.chunkSize);
+    }
+  }
+  return n;
+}
+
+async function waitHashingDone() {
+  for (let i = 0; i < 600 && !rec.hashingDone; i++) {
+    setPhase("等待服务端完成校验和…", "warn");
+    await sleep(1000);
+  }
+  if (!rec.hashingDone) throw new FatalError("服务端校验和长时间未完成，无法进行完整性验证");
+}
+
+/* ============================== 完整性校验 ============================== */
+
+function renderVerifyLines(lines) {
+  const out = document.getElementById("verify-body");
+  out.textContent = "";
+  lines.forEach((ln, i) => {
+    if (i) out.appendChild(document.createElement("br"));
+    out.appendChild(document.createTextNode(ln));
+  });
+}
+
+async function verify() {
+  const body = document.getElementById("verify-card");
+  body.style.display = "block";
+  const lines = [];
+  const bindings = [];
+  for (const f of rec.files) {
+    if (f.type === "dir") {
+      bindings.push(await fileBindingHash(f, ""));
+      continue;
+    }
+    if (!f.done.every(Boolean)) {
+      throw new FatalError("文件 " + f.path + " 仍有未完成块，不能校验");
+    }
+    if (f.hashes.some((h) => !h)) {
+      throw new FatalError("文件 " + f.path + " 缺少块哈希，不能校验");
+    }
+    const root = await merkleRoot(f.hashes);
+    if (root !== f.fileRoot) {
+      lines.push("✗ " + f.path + " 文件 Merkle root 不匹配");
+      throw new FatalError("完整性验证失败: " + f.path + " 的文件 Merkle root 不匹配");
+    }
+    lines.push("✓ " + f.path + "  " + f.chunks + " 块 / root " + root.slice(0, 16) + "…");
+    bindings.push(await fileBindingHash(f, root));
+  }
+  const global = await merkleRoot(bindings);
+  if (global !== rec.merkleRoot) {
+    lines.push("✗ 全局 Merkle root 不匹配");
+    lines.push("  本地: " + global);
+    lines.push("  清单: " + rec.merkleRoot);
+    renderVerifyLines(lines);
+    throw new FatalError("全局 Merkle root 不匹配，传输内容可能已损坏或被篡改");
+  }
+  lines.push("✓ 全局 Merkle root 验证通过: " + global);
+  renderVerifyLines(lines);
+  log("三级完整性验证通过（块 SHA-256 → 文件 root → 全局 root）");
+  return global;
+}
+
+/* ============================== 落盘：FS / Blob ============================== */
+
+function fsSupported() {
+  return !FORCE_BLOB &&
+    (typeof window.showSaveFilePicker === "function" ||
+     typeof window.showDirectoryPicker === "function");
+}
+
+const singleFile = () => rec.files.filter((f) => f.type === "file").length === 1;
+
+async function prepareFs() {
+  rec.mode = "fs";
+  const fileEntries = rec.files.filter((f) => f.type === "file");
+  if (singleFile()) {
+    const f = fileEntries[0];
+    if (!rec.fileHandles[f.index]) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: basename(f.path),
+        id: "qrcp-" + rec.token.slice(0, 8)
+      });
+      rec.fileHandles[f.index] = handle;
+    }
+  } else {
+    if (!rec.rootHandle) {
+      rec.rootHandle = await window.showDirectoryPicker({
+        id: "qrcp-" + rec.token.slice(0, 8),
+        mode: "readwrite"
+      });
+    }
+    const perm = await rec.rootHandle.requestPermission({ mode: "readwrite" });
+    if (perm !== "granted") throw new FatalError("未授予目录写入权限");
+    // 先建目录。
+    for (const d of rec.files.filter((x) => x.type === "dir").sort((a, b) =>
+      a.path.length - b.path.length)) {
+      await ensureDir(rec.rootHandle, d.path);
+    }
+    // 再建/取文件句柄。
+    for (const f of fileEntries) {
+      if (!rec.fileHandles[f.index]) {
+        const parent = await ensureDir(rec.rootHandle, dirname(f.path));
+        rec.fileHandles[f.index] =
+          await parent.getFileHandle(basename(f.path), { create: true });
+      }
+    }
+  }
+  // 空文件立即创建。
+  for (const f of fileEntries) {
+    if (f.chunks === 0) {
+      const wh = await rec.fileHandles[f.index].createWritable();
+      await wh.close();
+    }
+  }
+  scheduleSave(true);
+}
+
+async function ensureDir(root, path) {
+  if (!path) return root;
+  let cur = root;
+  for (const part of path.split("/")) {
+    cur = await cur.getDirectoryHandle(part, { create: true });
+  }
+  return cur;
+}
+
+async function reVerifyWrittenChunks() {
+  // 恢复会话时回读已写区块，发现损坏则作废重下。
+  let invalidated = 0;
+  for (const f of rec.files) {
+    if (f.type !== "file" || !f.done.some(Boolean)) continue;
+    const handle = rec.fileHandles[f.index];
+    if (!handle) {
+      f.done = new Array(f.chunks).fill(false);
+      invalidated += f.chunks;
+      continue;
+    }
+    const fileObj = await handle.getFile();
+    for (let ci = 0; ci < f.chunks; ci++) {
+      if (!f.done[ci]) continue;
+      if (!f.hashes[ci]) continue; // 清单未就绪，留待后续根校验
+      const start = ci * rec.chunkSize;
+      const end = Math.min(start + rec.chunkSize, f.size);
+      const slice = await fileObj.slice(start, end).arrayBuffer();
+      const h = await sha256Hex(new Uint8Array(slice));
+      if (h !== f.hashes[ci]) {
+        f.done[ci] = false;
+        invalidated++;
+        log("恢复时发现已写块损坏，标记重下: " + f.path + "#" + ci);
+      }
+    }
+  }
+  if (invalidated) log("恢复校验：" + invalidated + " 个块需要重新下载");
+}
+
+async function finalizeFs() {
+  for (const f of rec.files) {
+    await closeWritable(f.index);
+    f.saved = true;
+  }
+  rec.saved = true;
+  scheduleSave(true);
+}
+
+function prepareBlob() {
+  rec.mode = "blob";
+  scheduleSave(true);
+}
+
+async function saveBlobFile(fi) {
+  const f = rec.files[fi];
+  const parts = [];
+  for (let ci = 0; ci < f.chunks; ci++) {
+    const rec2 = await idbGet("chunks", chunkKey(rec.token, fi, ci));
+    if (!rec2) throw new FatalError("块缓存缺失: " + f.path + "#" + ci);
+    parts.push(rec2.b);
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(parts));
+  a.download = basename(f.path);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  f.saved = true;
+  scheduleSave(true);
+  renderSaveActions();
+  if (rec.files.every((x) => x.type === "dir" || x.saved)) {
+    await finishCompletion();
+  }
+}
+
+function renderSaveActions() {
+  const box = document.getElementById("save-actions");
+  if (rec.mode !== "blob") { box.innerHTML = ""; return; }
+  const files = rec.files.filter((f) => f.type === "file" && !f.saved);
+  if (!files.length) { box.innerHTML = ""; return; }
+  box.innerHTML = "<div style='margin-top:12px;font-size:13px'>浏览器不支持直接写盘，请逐个保存文件：</div>";
+  for (const f of files) {
+    const b = document.createElement("button");
+    b.className = "small secondary savefile";
+    b.textContent = "保存 " + f.path;
+    b.onclick = () => saveBlobFile(f.index).catch(fatal);
+    box.appendChild(b);
+  }
+  if (files.length > 1) {
+    const all = document.createElement("button");
+    all.className = "small";
+    all.textContent = "依次保存全部（" + files.length + " 个）";
+    all.onclick = async () => {
+      for (const f of files.slice()) {
+        if (!f.saved) await saveBlobFile(f.index);
+        await sleep(900);
+      }
+    };
+    box.appendChild(all);
+  }
+}
+
+async function finalizeSave() {
+  const hasFiles = rec.files.some((f) => f.type === "file");
+  if (!hasFiles) {
+    // 纯空目录传输（Blob 模式下没有可下载的文件），校验通过即完成。
+    await finishCompletion();
+    return;
+  }
+  setPhase("保存中", "warn");
+  if (rec.mode === "fs") {
+    await finalizeFs();
+    await finishCompletion();
+  } else {
+    renderSaveActions();
+    setPhase("等待保存到本机", "warn");
+  }
+}
+
+async function finishCompletion() {
+  rec.saved = true;
+  rec.finished = true;
+  scheduleSave(true);
+  setPhase("完成", "ok");
+  log("全部文件已保存，上报服务端完成。");
+  try {
+    await api("complete", { method: "POST" });
+  } catch (e) {
+    log("完成上报失败（不影响文件）: " + e.message);
+  }
+  render();
+  document.getElementById("btn-main").style.display = "none";
+  const clean = document.getElementById("btn-cleanup");
+  clean.style.display = "block";
+  if (rec.mode === "blob") clean.textContent = "清除本机分块缓存（已全部保存后再点）";
+}
+
+/* ============================== 主流程与恢复 ============================== */
+
+// 恢复时以 chunks store 中的实际缓存为准修正 done 标记（会话记录可能因
+// 节流或标签页被突然关闭而落后；块缓存本身是每次完成时同步落盘的）。
+async function recoverBlobChunks() {
+  if (rec.mode !== "blob") return;
+  const prefix = rec.token + ":";
+  const keys = (await idbAllKeys("chunks")).filter((k) =>
+    typeof k === "string" && k.indexOf(prefix) === 0);
+  let recovered = 0;
+  for (const k of keys) {
+    const parts = k.slice(prefix.length).split(":");
+    const fi = Number(parts[0]), ci = Number(parts[1]);
+    const f = rec.files[fi];
+    if (!f || f.type !== "file" || ci < 0 || ci >= f.chunks) continue;
+    const item = await idbGet("chunks", k);
+    if (!item || !item.b) continue;
+    const knownHash = f.hashes[ci];
+    if (knownHash && item.h && item.h !== knownHash) {
+      await idbDel("chunks", k); // 与清单冲突的陈旧缓存，作废重下
+      continue;
+    }
+    if (!f.done[ci]) {
+      f.done[ci] = true;
+      if (item.h) f.hashes[ci] = item.h;
+      recovered++;
+    }
+  }
+  if (recovered) log("从本机分块缓存恢复 " + recovered + " 个已完成块。");
+}
+
+async function startFlow() {
+  const btn = document.getElementById("btn-main");
+  btn.disabled = true;
+  try {
+    if (!rec.started) {
+      if (fsSupported()) {
+        await prepareFs();
+      } else {
+        prepareBlob();
+        log("当前浏览器不支持 File System Access API，使用分块缓存 + 下载保存模式。");
+      }
+      rec.started = true;
+      scheduleSave(true);
+    } else if (rec.mode === "fs" && rec.rootHandle) {
+      const perm = await rec.rootHandle.requestPermission({ mode: "readwrite" });
+      if (perm !== "granted") throw new FatalError("未授予目录写入权限");
+      await reVerifyWrittenChunks();
+    } else if (rec.mode === "fs") {
+      // 单文件模式：尝试重新授权。
+      const fh = rec.fileHandles[rec.files.find((f) => f.type === "file").index];
+      if (fh && fh.requestPermission) {
+        const perm = await fh.requestPermission({ mode: "readwrite" });
+        if (perm !== "granted") throw new FatalError("未授予文件写入权限");
+      }
+      await reVerifyWrittenChunks();
+    }
+    await downloadAll();
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      log("已取消选择，等待你的操作。");
+      btn.disabled = false;
+      setPhase("已暂停");
+      return;
+    }
+    fatal(e);
+  }
+}
+
+async function init() {
+  idb = await openDB();
+  let m;
+  try {
+    const resp = await api("manifest");
+    if (resp.status === 403) { setPhase("无权限", "err"); throw new FatalError("会话 token 校验失败 (403)"); }
+    if (resp.status === 410) return enterExpired();
+    if (!resp.ok) throw new Error("manifest HTTP " + resp.status);
+    m = await resp.json();
+  } catch (e) {
+    if (e instanceof ExpiredError) return enterExpired();
+    return fatal(e);
+  }
+  await mergeManifest(m);
+  if (Date.now() >= rec.expiresAt) return enterExpired();
+  await recoverBlobChunks();
+  if (!SUBTLE_OK) {
+    log("当前为非安全上下文（局域网 HTTP）：已自动启用内置 SHA-256 校验，" +
+      "并将使用浏览器下载模式保存文件；需要直接写入目录时请改用 qrcp --secure（HTTPS）。");
+  }
+  if (rec.started) scheduleSave(true);
+  const existing = rec.started;
+  const btn = document.getElementById("btn-main");
+  btn.disabled = false;
+  btn.textContent = existing ? (rec.mode === "fs" ? "恢复传输（需重新授权文件访问）" : "继续传输")
+                             : "开始传输";
+  setPhase(existing ? "可恢复" : "就绪");
+  btn.onclick = startFlow;
+  document.getElementById("btn-cleanup").onclick = cleanup;
+  if (existing) {
+    log("发现未完成的本地会话，可从 " + doneBytes() + " / " + totalBytes() +
+      " 字节处继续。");
+  }
+  pollManifest();
+  render();
+}
+
+function cleanup() {
+  if (!confirm("确定清除本会话已缓存的全部分块与传输状态吗？")) return;
+  (async () => {
+    const keys = await idbAllKeys("chunks");
+    await Promise.all(keys.filter((k) => k.indexOf(rec.token + ":") === 0)
+      .map((k) => idbDel("chunks", k)));
+    await idbDel("sessions", rec.token);
+    location.reload();
+  })();
+}
+
+function enterExpired() {
+  stopped = true;
+  setPhase("会话已过期", "err");
+  log("服务端会话已超过有效期，分块不再可用，请重新在发送端发起传输。");
+  const btn = document.getElementById("btn-main");
+  btn.disabled = true;
+  btn.textContent = "会话已过期";
+  render();
+}
+
+function fatal(e) {
+  console.error(e);
+  setPhase("出错", "err");
+  log("致命错误: " + (e && e.message ? e.message : e));
+  const btn = document.getElementById("btn-main");
+  btn.disabled = false;
+  btn.textContent = "重试";
+  btn.onclick = () => { stopped = false; downloadAll().catch(fatal); };
+  render();
+}
+
+/* ============================== 渲染 ============================== */
+
+function render() {
+  if (!rec) return;
+  const total = totalBytes();
+  const done = doneBytes();
+  const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  const bar = document.getElementById("overall-bar");
+  bar.firstElementChild.style.width = pct + "%";
+  bar.className = "bar" + (rec.finished ? " ok" : "");
+  document.getElementById("st-percent").textContent = pct + "%";
+  document.getElementById("st-bytes").textContent = fmtBytes(done) + " / " + fmtBytes(total);
+  const speed = currentSpeed();
+  document.getElementById("st-speed").textContent = speed ? fmtBytes(speed) + "/s" : "";
+  document.getElementById("st-eta").textContent =
+    speed && done < total ? "剩余约 " + fmtClock((total - done) / speed * 1000) : "";
+  document.getElementById("st-retries").textContent =
+    rec.corruptRetries ? "损坏重传 " + rec.corruptRetries + " 次" : "";
+  document.getElementById("session-info").textContent =
+    "会话 " + rec.token.slice(0, 10) + "… · 过期时间 " +
+    new Date(rec.expiresAt).toLocaleString() + " · 块大小 " + fmtBytes(rec.chunkSize);
+
+  const box = document.getElementById("files");
+  box.innerHTML = "";
+  for (const f of rec.files) {
+    const div = document.createElement("div");
+    div.className = "file";
+    let icon = "📄";
+    if (f.type === "dir") icon = "📁";
+    else if (f.saved || (f.type === "file" && f.chunks > 0 && f.done.every(Boolean))) icon = "✅";
+    const head = document.createElement("div");
+    head.className = "fname";
+    const ficon = document.createElement("span");
+    ficon.className = "ficon";
+    ficon.textContent = icon;
+    const fname = document.createElement("span");
+    fname.textContent = f.path; // 文件名可能含特殊字符，必须走 textContent
+    head.appendChild(ficon);
+    head.appendChild(fname);
+    div.appendChild(head);
+    if (f.type === "file") {
+      let fdone = 0;
+      for (let ci = 0; ci < f.chunks; ci++) {
+        if (f.done[ci]) fdone += Math.min(rec.chunkSize, f.size - ci * rec.chunkSize);
+      }
+      const fpct = f.size ? Math.round(fdone / f.size * 100) : 100;
+      const fbar = document.createElement("div");
+      fbar.className = "bar" + (fpct === 100 ? " ok" : "");
+      fbar.innerHTML = "<div style='width:" + fpct + "%'></div>";
+      div.appendChild(fbar);
+      const meta = document.createElement("div");
+      meta.className = "sub";
+      meta.textContent = fmtBytes(f.size) + " · " + f.chunks + " 块 · " + fpct + "%";
+      div.appendChild(meta);
+    }
+    box.appendChild(div);
+  }
+}
+
+// 速度表定时刷新（即使无新块完成也更新 ETA）。
+setInterval(() => { if (rec) render(); }, 1000);
+
+// 调试/自动化钩子，仅在 URL 带 ?debug=1 时暴露，生产页面不挂载。
+if (DEBUG_HOOKS) {
+  window.__qctp = {
+    state: () => rec,
+    fsSupported,
+    subtleOk: () => SUBTLE_OK,
+    // 模拟中断：当前在途块完成后停止调度，未完成块保留为缺失状态。
+    pause: () => { stopped = true; },
+    // 自动化：本轮最多调度 n 个块，随后自动中断（下载 6.5MB 回环瞬时完成时用）。
+    limit: (n) => { chunkCount = 0; chunkLimit = n; },
+    // 等待已完成块的会话状态落盘。
+    settled: () => sleep(700),
+    // 非安全上下文哈希兜底的自测入口。
+    sha256HexJs: async (data) => bytesToHex(sha256Js(data)),
+    resetAll: async () => {
+      const ks = await idbAllKeys("sessions");
+      await Promise.all(ks.map((k) => idbDel("sessions", k)));
+      const kc = await idbAllKeys("chunks");
+      await Promise.all(kc.map((k) => idbDel("chunks", k)));
+    }
+  };
+}
+
+// 标签页关闭/跳转前尽力刷盘（IDB 事务已发起通常可在后台完成）。
+window.addEventListener("pagehide", () => { if (rec) scheduleSave(true); });
+
+init().catch(fatal);
+</script>
+</body>
+</html>

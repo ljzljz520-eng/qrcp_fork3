@@ -2,30 +2,39 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"image/jpeg"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/claudiodangelis/qrcp/manifest"
 	"github.com/claudiodangelis/qrcp/qr"
 
-	"github.com/claudiodangelis/qrcp/body"
 	"github.com/claudiodangelis/qrcp/config"
 	"github.com/claudiodangelis/qrcp/pages"
 	"github.com/claudiodangelis/qrcp/util"
 	"gopkg.in/cheggaaa/pb.v1"
 )
+
+// tokenPlaceholder is replaced in the embedded transfer page with the
+// session token. The token itself is lowercase hex, so the replacement is
+// safe inside HTML and JavaScript contexts.
+const tokenPlaceholder = "__QCTP_TOKEN__"
 
 // Server is the server
 type Server struct {
@@ -33,14 +42,30 @@ type Server struct {
 	// SendURL is the URL used to send the file
 	SendURL string
 	// ReceiveURL is the URL used to Receive the file
-	ReceiveURL  string
-	instance    *http.Server
-	body        body.Body
-	outputDir   string
-	stopChannel chan bool
-	// expectParallelRequests is set to true when qrcp sends files, in order
-	// to support downloading of parallel chunks
-	expectParallelRequests bool
+	ReceiveURL   string
+	instance     *http.Server
+	mux          *http.ServeMux
+	outputDir    string
+	stopChannel  chan bool
+	shutdownOnce sync.Once
+
+	// QCTP send-side state
+	manifest   *manifest.Manifest
+	hasher     *manifest.Hasher
+	session    *manifest.Session
+	hashCancel context.CancelFunc
+	fault      *faultSpec
+
+	// Cookie locking the first browser client to the send page.
+	cookieMu sync.Mutex
+	cookie   http.Cookie
+
+	// Serving configuration, started explicitly via Serve() so that a send
+	// session can install its manifest before the first request is accepted.
+	listener net.Listener
+	secure   bool
+	tlsCert  string
+	tlsKey   string
 }
 
 // ReceiveTo sets the output directory
@@ -61,42 +86,51 @@ func (s *Server) ReceiveTo(dir string) error {
 	return nil
 }
 
-// Send adds a handler for sending the file
-func (s *Server) Send(p body.Body) {
-	s.body = p
-	s.expectParallelRequests = true
+// Send configures the QCTP manifest session served by the server and starts
+// the background hasher.
+func (s *Server) Send(m *manifest.Manifest, sess *manifest.Session) {
+	s.manifest = m
+	s.session = sess
+	s.hasher = manifest.NewHasher(m)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.hashCancel = cancel
+	s.hasher.Start(ctx)
 }
 
 // DisplayQR creates a handler for serving the QR code in the browser
 func (s *Server) DisplayQR(url string) {
-	const PATH = "/qr"
+	const path = "/qr"
 	qrImg := qr.RenderImage(url)
-	http.HandleFunc(PATH, func(w http.ResponseWriter, r *http.Request) {
+	s.mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
 		if err := jpeg.Encode(w, qrImg, nil); err != nil {
 			panic(err)
 		}
 	})
-	openBrowser(s.BaseURL + PATH)
+	openBrowser(s.BaseURL + path)
 }
 
-// Wait for transfer to be completed, it waits forever if kept awlive
-func (s Server) Wait() error {
+// Wait for transfer to be completed, it waits forever if kept alive
+func (s *Server) Wait() error {
 	<-s.stopChannel
+	if s.hashCancel != nil {
+		s.hashCancel()
+	}
 	if err := s.instance.Shutdown(context.Background()); err != nil {
 		log.Println(err)
-	}
-	if s.body.DeleteAfterTransfer {
-		if err := s.body.Delete(); err != nil {
-			panic(err)
-		}
 	}
 	return nil
 }
 
 // Shutdown the server
-func (s Server) Shutdown() {
-	s.stopChannel <- true
+func (s *Server) Shutdown() {
+	s.signalStop()
+}
+
+func (s *Server) signalStop() {
+	s.shutdownOnce.Do(func() {
+		go func() { s.stopChannel <- true }()
+	})
 }
 
 // New instance of the server
@@ -165,10 +199,8 @@ func New(cfg *config.Config) (*Server, error) {
 			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
 			PreferServerCipherSuites: true,
 			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384:       tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 			},
 		},
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
@@ -176,64 +208,84 @@ func New(cfg *config.Config) (*Server, error) {
 	// Create channel to send message to stop server
 	app.stopChannel = make(chan bool)
 	// Create cookie used to verify request is coming from first client to connect
-	cookie := http.Cookie{Name: "qrcp", Value: ""}
-	// Gracefully shutdown when an OS signal is received or when "q" is pressed
+	app.cookie = http.Cookie{Name: "qrcp", Value: ""}
+	// Gracefully shutdown when an OS signal is received
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	go func() {
 		<-sig
-		app.stopChannel <- true
+		app.signalStop()
 	}()
-	// The handler adds and removes from the sync.WaitGroup
-	// When the group is zero all requests are completed
-	// and the server is shutdown
-	var waitgroup sync.WaitGroup
-	waitgroup.Add(1)
-	var initCookie sync.Once
-	// Create handlers
-	// Send handler (sends file to caller)
-	http.HandleFunc("/send/"+path, func(w http.ResponseWriter, r *http.Request) {
-		if !cfg.KeepAlive && strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
-			if cookie.Value == "" {
-				initCookie.Do(func() {
-					value, err := util.GetSessionID()
-					if err != nil {
-						log.Println("Unable to generate session ID", err)
-						app.stopChannel <- true
-						return
-					}
-					cookie.Value = value
-					http.SetCookie(w, &cookie)
-				})
-			} else {
-				// Check for the expected cookie and value
-				// If it is missing or doesn't match
-				// return a 400 status
-				rcookie, err := r.Cookie(cookie.Name)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				if rcookie.Value != cookie.Value {
-					http.Error(w, "mismatching cookie", http.StatusBadRequest)
-					return
-				}
-				// If the cookie exits and matches
-				// this is an aadditional request.
-				// Increment the waitgroup
-				waitgroup.Add(1)
+	// Test-only fault injection for chunk responses (QRCP_TEST_FAULT=f:c:n).
+	app.fault = parseFaultSpec(os.Getenv("QRCP_TEST_FAULT"))
+	// Register all routes on a dedicated mux so the handler is testable.
+	app.mux = app.registerRoutes(cfg, path)
+	httpserver.Handler = app.mux
+	app.instance = httpserver
+	app.listener = listener
+	app.secure = cfg.Secure
+	app.tlsCert = cfg.TlsCert
+	app.tlsKey = cfg.TlsKey
+	return app, nil
+}
+
+// Serve starts accepting connections on the bound listener. For send sessions it
+// must be called after Send, so requests can never observe an unconfigured
+// server.
+func (s *Server) Serve() {
+	go func() {
+		netListener := tcpKeepAliveListener{s.listener.(*net.TCPListener)}
+		if s.secure {
+			if err := s.instance.ServeTLS(netListener, s.tlsCert, s.tlsKey); err != http.ErrServerClosed {
+				log.Fatalln("error starting the server:", err)
 			}
-			// Remove connection from the waitgroup when done
-			defer waitgroup.Done()
+		} else {
+			if err := s.instance.Serve(netListener); err != http.ErrServerClosed {
+				log.Fatalln("error starting the server", err)
+			}
 		}
-		w.Header().Set("Content-Disposition", "attachment; filename=\""+
-			app.body.Filename+
-			"\"; filename*=UTF-8''"+
-			url.QueryEscape(app.body.Filename))
-		http.ServeFile(w, r, app.body.Path)
+	}()
+}
+
+// registerRoutes builds the http.Handler for both the QCTP send session and
+// the legacy receive (upload) page.
+func (s *Server) registerRoutes(cfg *config.Config, path string) *http.ServeMux {
+	mux := http.NewServeMux()
+	sendPage := "/send/" + path
+	sendAPI := sendPage + "/api/"
+	// Transfer page (exact secret URL).
+	mux.HandleFunc(sendPage, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != sendPage {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.gateCookie(cfg, w, r) {
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.manifest == nil || s.session == nil {
+			http.Error(w, "no transfer configured", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.Method == http.MethodHead {
+			return
+		}
+		html := strings.ReplaceAll(pages.Transfer, tokenPlaceholder, s.session.Token)
+		io.WriteString(w, html)
 	})
-	// Upload handler (serves the upload page)
-	http.HandleFunc("/receive/"+path, func(w http.ResponseWriter, r *http.Request) {
+	// QCTP API.
+	mux.HandleFunc(sendAPI, func(w http.ResponseWriter, r *http.Request) {
+		if !s.gateCookie(cfg, w, r) {
+			return
+		}
+		s.handleQCTP(cfg, w, r, strings.TrimPrefix(r.URL.Path, sendAPI))
+	})
+	// Upload handler (serves the upload page) — receive direction, unchanged.
+	mux.HandleFunc("/receive/"+path, func(w http.ResponseWriter, r *http.Request) {
 		htmlVariables := struct {
 			Route string
 			File  string
@@ -241,12 +293,12 @@ func New(cfg *config.Config) (*Server, error) {
 		htmlVariables.Route = "/receive/" + path
 		switch r.Method {
 		case "POST":
-			filenames := util.ReadFilenames(app.outputDir)
+			filenames := util.ReadFilenames(s.outputDir)
 			reader, err := r.MultipartReader()
 			if err != nil {
 				fmt.Fprintf(w, "Upload error: %v\n", err)
 				log.Printf("Upload error: %v\n", err)
-				app.stopChannel <- true
+				s.signalStop()
 				return
 			}
 			transferredFiles := []string{}
@@ -263,14 +315,14 @@ func New(cfg *config.Config) (*Server, error) {
 				}
 				// Prepare the destination
 				fileName := getFileName(filepath.Base(part.FileName()), filenames)
-				out, err := os.Create(filepath.Join(app.outputDir, fileName))
+				out, err := os.Create(filepath.Join(s.outputDir, fileName))
 				if err != nil {
 					// Output to server
 					fmt.Fprintf(w, "Unable to create the file for writing: %s\n", err)
 					// Output to console
 					log.Printf("Unable to create the file for writing: %s\n", err)
 					// Send signal to server to shutdown
-					app.stopChannel <- true
+					s.signalStop()
 					return
 				}
 				defer out.Close()
@@ -290,7 +342,7 @@ func New(cfg *config.Config) (*Server, error) {
 						// Output to console
 						fmt.Printf("Unable to write file to disk: %v", err)
 						// Send signal to server to shutdown
-						app.stopChannel <- true
+						s.signalStop()
 						return
 					}
 					if n == 0 {
@@ -303,7 +355,7 @@ func New(cfg *config.Config) (*Server, error) {
 						// Output to console
 						log.Printf("Unable to write file to disk: %v", err)
 						// Send signal to server to shutdown
-						app.stopChannel <- true
+						s.signalStop()
 						return
 					}
 					progressBar.Add(n)
@@ -315,34 +367,192 @@ func New(cfg *config.Config) (*Server, error) {
 			htmlVariables.File = strings.Join(transferredFiles, ", ")
 			serveTemplate("done", pages.Done, w, htmlVariables)
 			if !cfg.KeepAlive {
-				app.stopChannel <- true
+				s.signalStop()
 			}
 		case "GET":
 			serveTemplate("upload", pages.Upload, w, htmlVariables)
 		}
 	})
-	// Wait for all wg to be done, then send shutdown signal
-	go func() {
-		waitgroup.Wait()
-		if cfg.KeepAlive || !app.expectParallelRequests {
+	return mux
+}
+
+// gateCookie implements the first-browser-client lock via a session cookie.
+// Non-Mozilla clients and keep-alive servers are unrestricted (legacy rule).
+func (s *Server) gateCookie(cfg *config.Config, w http.ResponseWriter, r *http.Request) bool {
+	if cfg.KeepAlive || !strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla") {
+		return true
+	}
+	s.cookieMu.Lock()
+	defer s.cookieMu.Unlock()
+	if s.cookie.Value == "" {
+		value, err := util.GetSessionID()
+		if err != nil {
+			log.Println("Unable to generate session ID", err)
+			s.signalStop()
+			http.Error(w, "session error", http.StatusInternalServerError)
+			return false
+		}
+		s.cookie.Value = value
+		http.SetCookie(w, &s.cookie)
+		return true
+	}
+	rcookie, err := r.Cookie(s.cookie.Name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	if rcookie.Value != s.cookie.Value {
+		http.Error(w, "mismatching cookie", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+// handleQCTP dispatches the /api/manifest, /api/chunk and /api/complete
+// endpoints of the qrcp chunked transfer protocol.
+func (s *Server) handleQCTP(cfg *config.Config, w http.ResponseWriter, r *http.Request, resource string) {
+	switch resource {
+	case "manifest":
+		s.apiManifest(w, r)
+	case "chunk":
+		s.apiChunk(w, r)
+	case "complete":
+		s.apiComplete(cfg, w, r)
+	default:
+		writeAPIError(w, http.StatusNotFound, "unknown endpoint")
+	}
+}
+
+func (s *Server) apiManifest(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodHead {
+		return
+	}
+	if err := json.NewEncoder(w).Encode(s.hasher.Snapshot(s.session)); err != nil {
+		log.Println("manifest encode error:", err)
+	}
+}
+
+func (s *Server) apiChunk(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	fi, err1 := strconv.Atoi(r.URL.Query().Get("f"))
+	ci, err2 := strconv.Atoi(r.URL.Query().Get("c"))
+	if err1 != nil || err2 != nil || fi < 0 || fi >= len(s.manifest.Files) {
+		writeAPIError(w, http.StatusNotFound, "unknown file or chunk")
+		return
+	}
+	entry := s.manifest.Files[fi]
+	if entry.Type != manifest.EntryFile || ci < 0 || int64(ci) >= entry.Chunks {
+		writeAPIError(w, http.StatusNotFound, "unknown file or chunk")
+		return
+	}
+	// Open the source before hashing: a missing file is a 404, and a size
+	// that no longer matches the manifest snapshot means the sender's file
+	// changed mid-transfer (TOCTOU) — fail loudly with 409 instead of
+	// serving bytes that could silently mismatch the declared size.
+	f, err := os.Open(entry.SourcePath)
+	if err != nil {
+		writeAPIError(w, http.StatusNotFound, "file unavailable: "+err.Error())
+		return
+	}
+	defer f.Close()
+	if info, statErr := f.Stat(); statErr != nil || info.Size() != entry.Size {
+		writeAPIError(w, http.StatusConflict, "source file changed since the transfer started; please restart the transfer")
+		return
+	}
+	hash, err := s.hasher.ChunkHash(r.Context(), int64(fi), int64(ci))
+	if err != nil {
+		if errors.Is(err, manifest.ErrSourceChanged) {
+			writeAPIError(w, http.StatusConflict, "source file changed since the transfer started; please restart the transfer")
 			return
 		}
-		app.stopChannel <- true
-	}()
-	go func() {
-		netListener := tcpKeepAliveListener{listener.(*net.TCPListener)}
-		if cfg.Secure {
-			if err := httpserver.ServeTLS(netListener, cfg.TlsCert, cfg.TlsKey); err != http.ErrServerClosed {
-				log.Fatalln("error starting the server:", err)
-			}
-		} else {
-			if err := httpserver.Serve(netListener); err != http.ErrServerClosed {
-				log.Fatalln("error starting the server", err)
-			}
+		writeAPIError(w, http.StatusInternalServerError, "hashing failure: "+err.Error())
+		return
+	}
+	offset := int64(ci) * s.manifest.ChunkSize
+	size := entry.Size - offset
+	if size > s.manifest.ChunkSize {
+		size = s.manifest.ChunkSize
+	}
+	buf := make([]byte, size)
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusInternalServerError, "read failure: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Chunk-Index", strconv.Itoa(ci))
+	w.Header().Set("X-Chunk-Sha256", hash)
+	w.Header().Set("Content-Length", strconv.Itoa(len(buf)))
+	if r.Method == http.MethodHead {
+		return
+	}
+	// Test-only corruption injection (the hash header keeps the true digest
+	// so the client detects and re-requests the chunk). Only GET responses
+	// consume the fault budget.
+	if s.fault != nil && s.fault.consume(fi, ci) && len(buf) > 0 {
+		buf[0] ^= 0xff
+	}
+	if _, err := w.Write(buf); err != nil {
+		log.Println("chunk write error:", err)
+	}
+}
+
+func (s *Server) apiComplete(cfg *config.Config, w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	if !cfg.KeepAlive {
+		s.signalStop()
+	}
+}
+
+// authorize validates the session token and expiry for API requests.
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if s.manifest == nil || s.session == nil {
+		writeAPIError(w, http.StatusNotFound, "no transfer configured")
+		return false
+	}
+	if s.session.Expired(time.Now()) {
+		writeAPIError(w, http.StatusGone, "session expired")
+		return false
+	}
+	token := r.Header.Get("X-QCTP-Token")
+	if token == "" {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "qrcp ") {
+			token = strings.TrimPrefix(auth, "qrcp ")
 		}
-	}()
-	app.instance = httpserver
-	return app, nil
+	}
+	if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.session.Token)) != 1 {
+		writeAPIError(w, http.StatusForbidden, "invalid token")
+		return false
+	}
+	return true
+}
+
+func writeAPIError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
 // openBrowser navigates to a url using the default system browser
